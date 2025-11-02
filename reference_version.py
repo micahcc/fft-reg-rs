@@ -238,9 +238,6 @@ def main():
     klog = shape[1] / np.log(radius)
     shift_scale = np.exp(shiftc / klog)
 
-    import ipdb
-
-    ipdb.set_trace()
     fig, axes = plt.subplots(3, 3, figsize=(8, 8))
     ax = axes.ravel()
     ax[0].set_title("Original Image FFT\n(magnitude; zoomed)")

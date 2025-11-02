@@ -1,9 +1,18 @@
-use image::{GenericImageView, GrayImage, ImageBuffer, Luma};
-use imageproc::geometric_transformations::{rotate_about_center, Interpolation};
+use image::{GenericImageView, GrayImage, ImageBuffer, ImageFormat, Luma};
+use imageproc::geometric_transformations::{rotate_about_center, translate, Interpolation};
 use num_complex::Complex;
 use rustfft::FftPlanner;
 use std::f32::consts::PI;
+use std::fs;
+use std::io;
 use std::path::Path;
+
+// Global constants
+const ANGLE: f32 = 24.0;
+const SCALE: f32 = 1.4;
+const SHIFTR: i32 = 30;
+const SHIFTC: i32 = 15;
+const SIGMA: f32 = 5.0; // sigma for LoG filter
 
 fn _log_polar_mapping(
     row: f32,
@@ -76,21 +85,41 @@ fn warp_polar2(image: &GrayImage, radius: u32, output_shape: (u32, u32)) -> Gray
     warped_image
 }
 
-fn bandpass_1d(rel: f32) -> f32 {
-    // 1d bandpass filter, after fourier shift
-    (rel * 2.0 * PI).sin().powi(2)
-}
-
-fn bandpass_2d(width: u32, height: u32) -> Vec<Vec<f32>> {
+fn laplacian_of_gaussians(width: u32, height: u32, sigma: f32) -> Vec<Vec<f32>> {
     let mut out = vec![vec![0.0; width as usize]; height as usize];
-    for y in 0..height {
-        for x in 0..width {
-            let a = bandpass_1d(y as f32 / height as f32);
-            let b = bandpass_1d(x as f32 / width as f32);
-            out[y as usize][x as usize] = a + b;
+    let scale = -1.0 / (PI * sigma.powi(4));
+    let scale2 = 1.0 / (2.0 * sigma * sigma);
+
+    for row in 0..height {
+        for col in 0..width {
+            let x = col as i32 - (width as i32 / 2);
+            let y = row as i32 - (height as i32 / 2);
+
+            let mdist = (x.pow(2) + y.pow(2)) as f32 * scale2;
+            out[row as usize][col as usize] = scale * (1.0 - mdist) * (-mdist).exp();
         }
     }
+
     out
+}
+
+fn make_log_filter(width: u32, height: u32, sigma: f32) -> Vec<Vec<Complex<f32>>> {
+    let spatial = laplacian_of_gaussians(width, height, sigma);
+
+    // Convert to complex
+    let mut complex_spatial = vec![vec![Complex::new(0.0, 0.0); width as usize]; height as usize];
+    for y in 0..height {
+        for x in 0..width {
+            complex_spatial[y as usize][x as usize] =
+                Complex::new(spatial[y as usize][x as usize], 0.0);
+        }
+    }
+
+    // Perform FFT
+    fft2d(&mut complex_spatial, false);
+    fftshift(&mut complex_spatial);
+
+    complex_spatial
 }
 
 fn tukey_value(n: u32, size: u32, alpha: f32) -> f32 {
@@ -248,6 +277,80 @@ fn complex_to_magnitude(img: &Vec<Vec<Complex<f32>>>) -> Vec<Vec<f32>> {
     magnitude
 }
 
+// Helper function to save complex images as 16-bit PNGs with autoscaling
+fn save_complex_image(complex_data: &Vec<Vec<Complex<f32>>>, prefix: &str) -> io::Result<()> {
+    let height = complex_data.len() as u32;
+    let width = complex_data[0].len() as u32;
+
+    // Extract real and imaginary parts
+    let mut real_values = vec![vec![0.0; width as usize]; height as usize];
+    let mut imag_values = vec![vec![0.0; width as usize]; height as usize];
+
+    // Find min and max values for autoscaling
+    let mut min_real = f32::MAX;
+    let mut max_real = f32::MIN;
+    let mut min_imag = f32::MAX;
+    let mut max_imag = f32::MIN;
+
+    for y in 0..height {
+        for x in 0..width {
+            let complex = complex_data[y as usize][x as usize];
+            let real = complex.re;
+            let imag = complex.im;
+
+            real_values[y as usize][x as usize] = real;
+            imag_values[y as usize][x as usize] = imag;
+
+            min_real = min_real.min(real);
+            max_real = max_real.max(real);
+            min_imag = min_imag.min(imag);
+            max_imag = max_imag.max(imag);
+        }
+    }
+
+    // Create 16-bit images
+    let real_file = format!("{}_real.png", prefix);
+    let imag_file = format!("{}_imag.png", prefix);
+
+    // Create 16-bit real part image
+    let real_img = ImageBuffer::from_fn(width, height, |x, y| {
+        let val = real_values[y as usize][x as usize];
+        // Scale to 0-65535 range
+        let range = max_real - min_real;
+        let scaled = if range > 1e-10 {
+            ((val - min_real) / range * 65535.0) as u16
+        } else {
+            // Handle flat data
+            32768 as u16
+        };
+        Luma([scaled])
+    });
+
+    // Create 16-bit imaginary part image
+    let imag_img = ImageBuffer::from_fn(width, height, |x, y| {
+        let val = imag_values[y as usize][x as usize];
+        // Scale to 0-65535 range
+        let range = max_imag - min_imag;
+        let scaled = if range > 1e-10 {
+            ((val - min_imag) / range * 65535.0) as u16
+        } else {
+            // Handle flat data
+            32768 as u16
+        };
+        Luma([scaled])
+    });
+
+    // Save images
+    real_img
+        .save_with_format(&real_file, ImageFormat::Png)
+        .unwrap();
+    imag_img
+        .save_with_format(&imag_file, ImageFormat::Png)
+        .unwrap();
+
+    Ok(())
+}
+
 // Helper function to convert magnitude to GrayImage
 fn magnitude_to_image(magnitude: &Vec<Vec<f32>>) -> GrayImage {
     let height = magnitude.len() as u32;
@@ -274,6 +377,79 @@ fn magnitude_to_image(magnitude: &Vec<Vec<f32>>) -> GrayImage {
 }
 
 // Helper function for phase cross correlation
+fn has_at_least_one_factor_of_three(n: usize) -> bool {
+    n % 3 == 0
+}
+
+fn is_composed_of_2s_and_3s(n: usize) -> bool {
+    let mut num = n;
+    while num % 2 == 0 {
+        num /= 2;
+    }
+    while num % 3 == 0 {
+        num /= 3;
+    }
+    num == 1
+}
+
+fn round_up_to_next_valid_number(n: usize) -> usize {
+    let mut num = n;
+    while !(is_composed_of_2s_and_3s(num) && has_at_least_one_factor_of_three(num)) {
+        num += 1;
+    }
+    num
+}
+
+fn pad_for_fft(image: &GrayImage) -> GrayImage {
+    let old_width = image.width() as usize;
+    let old_height = image.height() as usize;
+    let new_width = round_up_to_next_valid_number(old_width);
+    let new_height = round_up_to_next_valid_number(old_height);
+
+    let mut padded = ImageBuffer::new(new_width as u32, new_height as u32);
+
+    // Copy original image data
+    for y in 0..old_height {
+        for x in 0..old_width {
+            padded.put_pixel(x as u32, y as u32, *image.get_pixel(x as u32, y as u32));
+        }
+    }
+
+    padded
+}
+
+fn apply_changes(image: &GrayImage) -> GrayImage {
+    // Apply transformations: translate, rotate, scale
+    let translated = imageproc::geometric_transformations::translate(image, (SHIFTC, SHIFTR));
+
+    // Create rotated image
+    let rotated = rotate_about_center(
+        &translated,
+        ANGLE.to_radians(),
+        Interpolation::Bilinear,
+        Luma([0]),
+    );
+
+    // Rescale is more complex, we'll approximate it with a simple resize
+    let rescaled = image::imageops::resize(
+        &rotated,
+        (rotated.width() as f32 * SCALE) as u32,
+        (rotated.height() as f32 * SCALE) as u32,
+        image::imageops::FilterType::Lanczos3,
+    );
+
+    // Crop to original size if larger
+    let result = ImageBuffer::from_fn(image.width(), image.height(), |x, y| {
+        if x < rescaled.width() && y < rescaled.height() {
+            *rescaled.get_pixel(x, y)
+        } else {
+            Luma([0])
+        }
+    });
+
+    result
+}
+
 fn phase_cross_correlation(
     img1: &Vec<Vec<Complex<f32>>>,
     img2: &Vec<Vec<Complex<f32>>>,
@@ -329,50 +505,23 @@ fn phase_cross_correlation(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Parameters matching Python version
-    let angle: f32 = 24.0;
-    let scale = 1.4;
-    let shiftr = 30;
-    let shiftc = 15;
-
     // Load the image
     let img = image::open(Path::new("brick.jpg"))?.to_luma8();
-    let (image_width, image_height) = (img.width(), img.height());
 
-    // Create translated image
-    let translated = imageproc::geometric_transformations::translate(&img, (shiftc, shiftr));
+    // Apply transformations
+    let rts_image = apply_changes(&img);
 
-    // Create rotated image
-    let rotated = imageproc::geometric_transformations::rotate_about_center(
-        &translated,
-        angle.to_radians(),
-        Interpolation::Bilinear,
-        Luma([0]),
-    );
-
-    // Rescale is more complex, we'll approximate it with a simple resize
-    let rescaled = image::imageops::resize(
-        &rotated,
-        (rotated.width() as f32 * scale) as u32,
-        (rotated.height() as f32 * scale) as u32,
-        image::imageops::FilterType::Lanczos3,
-    );
-
-    // Crop to original size if larger
-    let rts_image = ImageBuffer::from_fn(img.width(), img.height(), |x, y| {
-        if x < rescaled.width() && y < rescaled.height() {
-            *rescaled.get_pixel(x, y)
-        } else {
-            Luma([0])
-        }
-    });
+    // Pad both images for FFT
+    let img_padded = pad_for_fft(&img);
+    let rts_image_padded = pad_for_fft(&rts_image);
+    let (image_width, image_height) = (img_padded.width(), img_padded.height());
 
     // Create Tukey window
     let tukey_window = tukey_window_2d(image_width, image_height, 1.0);
 
     // Window images
-    let mut wimage_complex = image_to_complex(&img);
-    let mut rts_wimage_complex = image_to_complex(&rts_image);
+    let mut wimage_complex = image_to_complex(&img_padded);
+    let mut rts_wimage_complex = image_to_complex(&rts_image_padded);
 
     apply_window(&mut wimage_complex, &tukey_window);
     apply_window(&mut rts_wimage_complex, &tukey_window);
@@ -385,13 +534,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fftshift(&mut wimage_complex);
     fftshift(&mut rts_wimage_complex);
 
-    // Apply bandpass filter
-    let bp_filt = bandpass_2d(image_width, image_height);
+    // Save original FFT data
+    save_complex_image(&wimage_complex, "fft_orig")?;
+    save_complex_image(&rts_wimage_complex, "fft_transformed")?;
+
+    // Apply Laplacian of Gaussians bandpass filter
+    let bp_filt = make_log_filter(image_width, image_height, SIGMA);
+    save_complex_image(&bp_filt, "bandpass")?;
     for y in 0..wimage_complex.len() {
         for x in 0..wimage_complex[0].len() {
             wimage_complex[y][x] *= bp_filt[y][x];
             rts_wimage_complex[y][x] *= bp_filt[y][x];
         }
+
+        // Save filtered FFT data
+        save_complex_image(&wimage_complex, "fft_filtered_orig")?;
+        save_complex_image(&rts_wimage_complex, "fft_filtered_transformed")?;
     }
 
     // Save filtered images (for visualization)
@@ -401,8 +559,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fftshift(&mut image_fs_filtered);
     fftshift(&mut rts_fs_filtered);
 
+    // Save shifted data before inverse FFT
+    save_complex_image(&image_fs_filtered, "fft_shifted_orig")?;
+    save_complex_image(&rts_fs_filtered, "fft_shifted_transformed")?;
+
     fft2d(&mut image_fs_filtered, true);
     fft2d(&mut rts_fs_filtered, true);
+
+    // Save data after inverse FFT
+    save_complex_image(&image_fs_filtered, "ifft_orig")?;
+    save_complex_image(&rts_fs_filtered, "ifft_transformed")?;
 
     // Get magnitudes for log-polar transform
     let image_fs_mag = complex_to_magnitude(&wimage_complex);
@@ -436,6 +602,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fft2d(&mut warped_image_complex, false);
     fft2d(&mut warped_rts_complex, false);
 
+    // Save cross-correlation FFT data
+    save_complex_image(&warped_image_complex, "cross_corr_orig")?;
+    save_complex_image(&warped_rts_complex, "cross_corr_transformed")?;
+
     // Calculate phase cross correlation
     let (shiftr, shiftc) = phase_cross_correlation(&warped_image_complex, &warped_rts_complex);
 
@@ -467,37 +637,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     tukey_window_img.save("output_tukey_window.png")?;
 
-    // Create windowed images for visualization
-    let windowed_original = ImageBuffer::from_fn(image_width, image_height, |x, y| {
-        let val = (img.get_pixel(x, y).0[0] as f32 * tukey_window[y as usize][x as usize]) as u8;
-        Luma([val])
-    });
-
-    let windowed_transformed = ImageBuffer::from_fn(image_width, image_height, |x, y| {
-        let val =
-            (rts_image.get_pixel(x, y).0[0] as f32 * tukey_window[y as usize][x as usize]) as u8;
-        Luma([val])
-    });
-
-    windowed_original.save("output_windowed_original.png")?;
-    windowed_transformed.save("output_windowed_transformed.png")?;
-
-    // Save bandpass filter visualization
-    let bandpass_img = ImageBuffer::from_fn(image_width, image_height, |x, y| {
-        let val = (bp_filt[y as usize][x as usize] * 255.0) as u8;
-        Luma([val])
-    });
-    bandpass_img.save("output_bandpass_filter.png")?;
-
     // Save original and transformed images
     img.save("output_original.png")?;
     rts_image.save("output_transformed.png")?;
 
     // Print results
-    println!("Expected value for cc rotation in degrees: {}", angle);
+    println!("Expected value for cc rotation in degrees: {}", ANGLE);
     println!("Recovered value for cc rotation: {}", recovered_angle);
     println!();
-    println!("Expected value for scaling difference: {}", scale);
+    println!("Expected value for scaling difference: {}", SCALE);
     println!("Recovered value for scaling difference: {}", shift_scale);
 
     // Save results to a text file
@@ -506,7 +654,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          Recovered value for cc rotation: {}\n\n\
          Expected value for scaling difference: {}\n\
          Recovered value for scaling difference: {}\n",
-        angle, recovered_angle, scale, shift_scale
+        ANGLE, recovered_angle, SCALE, shift_scale
     );
 
     std::fs::write("output_results.txt", result_text)?;
