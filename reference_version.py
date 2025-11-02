@@ -5,7 +5,6 @@ import matplotlib.pyplot as plt
 
 from skimage.filters import window, difference_of_gaussians
 from scipy.fft import ifft2, fft2, fftshift
-from skimage import data
 from skimage.registration import phase_cross_correlation
 from skimage.transform import rotate, rescale
 
@@ -112,8 +111,7 @@ def main():
     shiftr = 30
     shiftc = 15
 
-    image = skimage.data.camera()
-    # image = np.array(Image.open("brick.jpg"))
+    image = np.array(Image.open("brick.jpg"))
 
     translated = image[shiftr:, shiftc:]
     rotated = rotate(translated, angle)
