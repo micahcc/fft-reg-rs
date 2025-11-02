@@ -8,7 +8,6 @@ from scipy.fft import ifft2, fft2, fftshift
 from skimage import data
 from skimage.registration import phase_cross_correlation
 from skimage.transform import rotate, rescale
-from skimage.util import img_as_float
 
 
 def _log_polar_mapping(row, col, k_angle, k_radius, center):
