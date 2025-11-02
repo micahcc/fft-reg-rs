@@ -298,6 +298,8 @@ version = "0.1.0"
 dependencies = [
  "image",
  "imageproc",
+ "num-complex",
+ "num-traits",
  "rustfft",
 ]
 
