@@ -14,6 +14,20 @@ SCALE = 1.4
 SHIFTR = 30
 SHIFTC = 15
 
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+def phase_correlation(a, b):
+    G_a = np.fft.fft2(a)
+    G_b = np.fft.fft2(b)
+    conj_b = np.ma.conjugate(G_b)
+    R = G_a * conj_b
+    R /= np.absolute(R)
+    r = np.fft.ifft2(R).real
+    shifts = np.unravel_index(r.argmax(), a.shape)
+    return shifts
+
 
 def laplacian_of_gaussians(width, height, sigma):
     out = np.zeros((height, width))
@@ -189,9 +203,6 @@ def main():
     rts_wimage = rts_image * tukey_image
 
     # work with shifted FFT magnitudes
-    image_fs = np.abs(fftshift(fft2(wimage)))
-    rts_fs = np.abs(fftshift(fft2(rts_wimage)))
-
     image_fs = fftshift(fft2(wimage))
     rts_fs = fftshift(fft2(rts_wimage))
 
@@ -226,17 +237,16 @@ def main():
         output_shape=shape,
     )
 
-    warped_image_fs = warped_image_fs[: shape[0] // 2, :]  # only use half of FFT
-    warped_rts_fs = warped_rts_fs[: shape[0] // 2, :]
-    shifts, error, phasediff = phase_cross_correlation(
-        warped_image_fs, warped_rts_fs, upsample_factor=10, normalization=None
-    )
+    shifts = phase_correlation(warped_image_fs, warped_rts_fs)
 
     # Use translation parameters to calculate rotation and scaling parameters
-    shiftr, shiftc = shifts[:2]
+    shiftr, shiftc = shifts[0], shifts[1]
     recovered_angle = (360 / shape[0]) * shiftr
     klog = shape[1] / np.log(radius)
     shift_scale = np.exp(shiftc / klog)
+    print(
+        f"Logpolar shifts: {shiftr}, {shiftc}, angle: {recovered_angle}, scale: {shift_scale}"
+    )
 
     fig, axes = plt.subplots(3, 3, figsize=(8, 8))
     ax = axes.ravel()

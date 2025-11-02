@@ -1,10 +1,7 @@
-use image::{GenericImageView, GrayImage, ImageBuffer, ImageFormat, Luma};
-use imageproc::geometric_transformations::{rotate_about_center, translate, Interpolation};
+use image::{GrayImage, ImageBuffer, ImageFormat, Luma};
 use num_complex::Complex;
 use rustfft::FftPlanner;
 use std::f32::consts::PI;
-use std::fs;
-use std::io;
 use std::path::Path;
 
 // Global constants
@@ -13,6 +10,101 @@ const SCALE: f32 = 1.4;
 const SHIFTR: i32 = 30;
 const SHIFTC: i32 = 15;
 const SIGMA: f32 = 5.0; // sigma for LoG filter
+
+#[derive(Clone, Debug)]
+struct ComplexImage {
+    width: usize,
+    height: usize,
+    pixels: Vec<Complex<f32>>,
+}
+
+impl ComplexImage {
+    fn new(width: usize, height: usize) -> Self {
+        ComplexImage {
+            width,
+            height,
+            pixels: vec![Complex::new(0.0, 0.0); width * height],
+        }
+    }
+
+    fn get_pixel(&self, x: usize, y: usize) -> &Complex<f32> {
+        &self.pixels[y * self.width + x]
+    }
+
+    fn put_pixel(&mut self, x: usize, y: usize, v: Complex<f32>) {
+        self.pixels[y * self.width + x] = v;
+    }
+
+    fn make_cropped(&self, xstart: usize, ystart: usize, width: usize, height: usize) -> Self {
+        let mut out = Self::new(width, height);
+        let xstop = (xstart + width).min(self.width);
+        let ystop = (ystart + height).min(self.height);
+        for y in ystart..ystop {
+            for x in xstart..xstop {
+                out.put_pixel(x, y, *self.get_pixel(x, y));
+            }
+        }
+        out
+    }
+
+    // Helper function to save complex images as 16-bit PNGs with autoscaling
+    fn save(&self, prefix: &str) {
+        let height = self.height as u32;
+        let width = self.width as u32;
+
+        // Find min and max values for autoscaling
+        let mut min_mag = f32::MAX;
+        let mut max_mag = f32::MIN;
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let complex = self.get_pixel(x, y);
+                min_mag = min_mag.min(complex.norm());
+                max_mag = max_mag.max(complex.norm());
+            }
+        }
+        let range = (max_mag - min_mag) as f32;
+
+        // Create 16-bit images
+        let real_file = format!("{}_real.png", prefix);
+        let imag_file = format!("{}_imag.png", prefix);
+        let mag_file = format!("{}_mag.png", prefix);
+
+        // Create 16-bit real part image
+        let real_img = ImageBuffer::from_fn(width, height, |x, y| {
+            let val = self.get_pixel(x as usize, y as usize).re;
+            // Scale to 0-65535 range
+            let scaled = ((val - min_mag) / range * 65535.0) as u16;
+            Luma([scaled])
+        });
+
+        // Create 16-bit imaginary part image
+        let imag_img = ImageBuffer::from_fn(width, height, |x, y| {
+            let val = self.get_pixel(x as usize, y as usize).im;
+            // Scale to 0-65535 range
+            let scaled = ((val - min_mag) / range * 65535.0) as u16;
+            Luma([scaled])
+        });
+
+        // Create 16-bit imaginary part image
+        let mag_img = ImageBuffer::from_fn(width, height, |x, y| {
+            let val = self.get_pixel(x as usize, y as usize).norm();
+            // Scale to 0-65535 range
+            let scaled = ((val - min_mag) / range * 65535.0) as u16;
+            Luma([scaled])
+        });
+
+        // Save images
+        real_img
+            .save_with_format(&real_file, ImageFormat::Png)
+            .unwrap();
+        imag_img
+            .save_with_format(&imag_file, ImageFormat::Png)
+            .unwrap();
+        mag_img
+            .save_with_format(&mag_file, ImageFormat::Png)
+            .unwrap();
+    }
+}
 
 fn _log_polar_mapping(
     row: f32,
@@ -28,16 +120,15 @@ fn _log_polar_mapping(
     return (rr, cc);
 }
 
-fn warp_polar2(image: &GrayImage, radius: u32, output_shape: (u32, u32)) -> GrayImage {
-    let (width, height) = output_shape;
+fn warp_polar2(image: &ComplexImage, radius: u32, width: usize, height: usize) -> ComplexImage {
     let center = (
-        (image.height() as f32 / 2.0) - 0.5,
-        (image.width() as f32 / 2.0) - 0.5,
+        (image.height as f32 / 2.0) - 0.5,
+        (image.width as f32 / 2.0) - 0.5,
     );
     let k_angle = height as f32 / (2.0 * PI);
     let k_radius = width as f32 / (radius as f32).ln();
 
-    let mut warped_image = ImageBuffer::new(width, height);
+    let mut warped_image = ComplexImage::new(width, height);
 
     for y in 0..height {
         for x in 0..width {
@@ -52,31 +143,35 @@ fn warp_polar2(image: &GrayImage, radius: u32, output_shape: (u32, u32)) -> Gray
             let y1 = y0 + 1;
 
             // Check if all interpolation points are within bounds
-            if x0 >= 0 && (x1 as u32) < image.width() && y0 >= 0 && (y1 as u32) < image.height() {
+            if x0 >= 0 && (x1 as usize) < image.width && y0 >= 0 && (y1 as usize) < image.height {
                 // Calculate interpolation weights
                 let wx = cc - x0 as f32;
                 let wy = rr - y0 as f32;
 
                 // Perform bilinear interpolation
-                let top = image.get_pixel(x0 as u32, y0 as u32).0[0] as f32 * (1.0 - wx)
-                    + image.get_pixel(x1 as u32, y0 as u32).0[0] as f32 * wx;
-                let bottom = image.get_pixel(x0 as u32, y1 as u32).0[0] as f32 * (1.0 - wx)
-                    + image.get_pixel(x1 as u32, y1 as u32).0[0] as f32 * wx;
-                let val = (top * (1.0 - wy) + bottom * wy) as u8;
-                warped_image.put_pixel(x, y, Luma([val]));
+                let top = image.get_pixel(x0 as usize, y0 as usize) * (1.0 - wx)
+                    + image.get_pixel(x1 as usize, y0 as usize) * wx;
+                let bottom = image.get_pixel(x0 as usize, y1 as usize) * (1.0 - wx)
+                    + image.get_pixel(x1 as usize, y1 as usize) * wx;
+                let val = top * (1.0 - wy) + bottom * wy;
+                warped_image.put_pixel(x, y, val);
             } else {
                 // Handle boundary cases with nearest neighbor
                 let input_x = cc.round() as i32;
                 let input_y = rr.round() as i32;
 
                 if input_x >= 0
-                    && (input_x as u32) < image.width()
+                    && (input_x as usize) < image.width
                     && input_y >= 0
-                    && (input_y as u32) < image.height()
+                    && (input_y as usize) < image.height
                 {
-                    warped_image.put_pixel(x, y, *image.get_pixel(input_x as u32, input_y as u32));
+                    warped_image.put_pixel(
+                        x,
+                        y,
+                        *image.get_pixel(input_x as usize, input_y as usize),
+                    );
                 } else {
-                    warped_image.put_pixel(x, y, Luma([0]));
+                    warped_image.put_pixel(x, y, Complex::new(0.0, 0.0));
                 }
             }
         }
@@ -85,8 +180,8 @@ fn warp_polar2(image: &GrayImage, radius: u32, output_shape: (u32, u32)) -> Gray
     warped_image
 }
 
-fn laplacian_of_gaussians(width: u32, height: u32, sigma: f32) -> Vec<Vec<f32>> {
-    let mut out = vec![vec![0.0; width as usize]; height as usize];
+fn laplacian_of_gaussians(width: usize, height: usize, sigma: f32) -> ComplexImage {
+    let mut out = ComplexImage::new(width, height);
     let scale = -1.0 / (PI * sigma.powi(4));
     let scale2 = 1.0 / (2.0 * sigma * sigma);
 
@@ -96,27 +191,21 @@ fn laplacian_of_gaussians(width: u32, height: u32, sigma: f32) -> Vec<Vec<f32>> 
             let y = row as i32 - (height as i32 / 2);
 
             let mdist = (x.pow(2) + y.pow(2)) as f32 * scale2;
-            out[row as usize][col as usize] = scale * (1.0 - mdist) * (-mdist).exp();
+            out.put_pixel(
+                col,
+                row,
+                Complex::new(scale * (1.0 - mdist) * (-mdist).exp(), 0.0),
+            );
         }
     }
 
     out
 }
 
-fn make_log_filter(width: u32, height: u32, sigma: f32) -> Vec<Vec<Complex<f32>>> {
-    let spatial = laplacian_of_gaussians(width, height, sigma);
+fn make_log_filter(width: usize, height: usize, sigma: f32) -> ComplexImage {
+    let mut complex_spatial = laplacian_of_gaussians(width, height, sigma);
 
-    // Convert to complex
-    let mut complex_spatial = vec![vec![Complex::new(0.0, 0.0); width as usize]; height as usize];
-    for y in 0..height {
-        for x in 0..width {
-            complex_spatial[y as usize][x as usize] =
-                Complex::new(spatial[y as usize][x as usize], 0.0);
-        }
-    }
-
-    // Perform FFT
-    fft2d(&mut complex_spatial, false);
+    fft2d(&mut complex_spatial);
     fftshift(&mut complex_spatial);
 
     complex_spatial
@@ -149,15 +238,15 @@ fn tukey_window_2d(width: u32, height: u32, alpha: f32) -> Vec<Vec<f32>> {
     window_2d
 }
 
-// Helper function to convert GrayImage to a 2D vector of Complex<f32>
-fn image_to_complex(img: &GrayImage) -> Vec<Vec<Complex<f32>>> {
-    let (width, height) = (img.width(), img.height());
-    let mut result = vec![vec![Complex::new(0.0, 0.0); width as usize]; height as usize];
+// Helper function to convert GrayImage to ComplexImage
+fn image_to_complex(img: &GrayImage) -> ComplexImage {
+    let (width, height) = (img.width() as usize, img.height() as usize);
+    let mut result = ComplexImage::new(width, height);
 
     for y in 0..height {
         for x in 0..width {
-            let val = img.get_pixel(x, y).0[0] as f32;
-            result[y as usize][x as usize] = Complex::new(val, 0.0);
+            let val = img.get_pixel(x as u32, y as u32).0[0] as f32;
+            result.put_pixel(x, y, Complex::new(val, 0.0));
         }
     }
 
@@ -165,82 +254,99 @@ fn image_to_complex(img: &GrayImage) -> Vec<Vec<Complex<f32>>> {
 }
 
 // Helper function to apply a 2D window to a complex image
-fn apply_window(img: &mut Vec<Vec<Complex<f32>>>, window: &Vec<Vec<f32>>) {
-    for y in 0..img.len() {
-        for x in 0..img[0].len() {
-            img[y][x] *= window[y][x];
+fn apply_window(img: &mut ComplexImage, window: &Vec<Vec<f32>>) {
+    for y in 0..img.height {
+        for x in 0..img.width {
+            let pixel = img.get_pixel(x, y);
+            img.put_pixel(x, y, *pixel * window[y][x]);
         }
     }
 }
 
-// Helper function to perform 2D FFT
-fn fft2d(img: &mut Vec<Vec<Complex<f32>>>, inverse: bool) {
-    let height = img.len();
-    let width = img[0].len();
+fn ifft2d(img: &mut ComplexImage) {
+    let height = img.height;
+    let width = img.width;
     let mut planner = FftPlanner::new();
 
     // First, perform FFT on each row
-    let fft = if inverse {
-        planner.plan_fft_inverse(width)
-    } else {
-        planner.plan_fft_forward(width)
-    };
+    let fft = planner.plan_fft_inverse(width);
 
-    for row in img.iter_mut() {
-        fft.process(row);
-        if inverse {
-            // Scale inverse FFT
-            for val in row.iter_mut() {
-                *val /= width as f32;
-            }
-        }
-    }
-
-    // Transpose for column-wise FFT
-    let mut transposed = vec![vec![Complex::new(0.0, 0.0); height]; width];
+    // Process rows
+    let mut tmp = vec![Complex::new(0.0, 0.0); width];
     for y in 0..height {
         for x in 0..width {
-            transposed[x][y] = img[y][x];
+            tmp[x] = *img.get_pixel(x, y);
+        }
+        fft.process(&mut tmp);
+        for (x, val) in tmp.iter_mut().enumerate() {
+            img.put_pixel(x, y, *val);
         }
     }
 
     // Perform FFT on each column (now row in transposed matrix)
-    let fft = if inverse {
-        planner.plan_fft_inverse(height)
-    } else {
-        planner.plan_fft_forward(height)
-    };
+    let fft = planner.plan_fft_inverse(height);
 
-    for row in transposed.iter_mut() {
-        fft.process(row);
-        if inverse {
-            // Scale inverse FFT
-            for val in row.iter_mut() {
-                *val /= height as f32;
-            }
+    // Process columns (rows in transposed image)
+    tmp.resize(height, Complex::new(0.0, 0.0));
+    for x in 0..width {
+        for y in 0..height {
+            tmp[y] = *img.get_pixel(x, y);
+        }
+        fft.process(&mut tmp);
+        for (y, val) in tmp.iter_mut().enumerate() {
+            img.put_pixel(x, y, *val);
+        }
+    }
+}
+
+fn fft2d(img: &mut ComplexImage) {
+    let height = img.height;
+    let width = img.width;
+    let mut planner = FftPlanner::new();
+
+    // First, perform FFT on each row
+    let fft = planner.plan_fft_forward(width);
+
+    // Process rows
+    let mut tmp = vec![Complex::new(0.0, 0.0); width];
+    for y in 0..height {
+        for x in 0..width {
+            tmp[x] = *img.get_pixel(x, y);
+        }
+        fft.process(&mut tmp);
+        for (x, val) in tmp.iter_mut().enumerate() {
+            img.put_pixel(x, y, *val);
         }
     }
 
-    // Transpose back
-    for y in 0..height {
-        for x in 0..width {
-            img[y][x] = transposed[x][y];
+    // Perform FFT on each column (now row in transposed matrix)
+    let fft = planner.plan_fft_forward(height);
+
+    // Process columns (rows in transposed image)
+    tmp.resize(height, Complex::new(0.0, 0.0));
+    for x in 0..width {
+        for y in 0..height {
+            tmp[y] = *img.get_pixel(x, y);
+        }
+        fft.process(&mut tmp);
+        for (y, val) in tmp.iter_mut().enumerate() {
+            img.put_pixel(x, y, *val);
         }
     }
 }
 
 // Helper function to perform FFT shift (swap quadrants)
-fn fftshift(img: &mut Vec<Vec<Complex<f32>>>) {
-    let height = img.len();
-    let width = img[0].len();
+fn fftshift(img: &mut ComplexImage) {
+    let height = img.height;
+    let width = img.width;
     let half_height = height / 2;
     let half_width = width / 2;
 
     // Create a copy of the image
-    let mut temp = vec![vec![Complex::new(0.0, 0.0); width]; height];
+    let mut temp = ComplexImage::new(width, height);
     for y in 0..height {
         for x in 0..width {
-            temp[y][x] = img[y][x];
+            temp.put_pixel(x, y, *img.get_pixel(x, y));
         }
     }
 
@@ -248,132 +354,33 @@ fn fftshift(img: &mut Vec<Vec<Complex<f32>>>) {
     // Upper-left with lower-right
     for y in 0..half_height {
         for x in 0..half_width {
-            img[y][x] = temp[y + half_height][x + half_width];
-            img[y + half_height][x + half_width] = temp[y][x];
+            img.put_pixel(x, y, *temp.get_pixel(x + half_width, y + half_height));
+            img.put_pixel(x + half_width, y + half_height, *temp.get_pixel(x, y));
         }
     }
 
     // Upper-right with lower-left
     for y in 0..half_height {
         for x in half_width..width {
-            img[y][x] = temp[y + half_height][x - half_width];
-            img[y + half_height][x - half_width] = temp[y][x];
+            img.put_pixel(x, y, *temp.get_pixel(x - half_width, y + half_height));
+            img.put_pixel(x - half_width, y + half_height, *temp.get_pixel(x, y));
         }
     }
 }
 
 // Helper function to get magnitude of complex image
-fn complex_to_magnitude(img: &Vec<Vec<Complex<f32>>>) -> Vec<Vec<f32>> {
-    let height = img.len();
-    let width = img[0].len();
-    let mut magnitude = vec![vec![0.0; width]; height];
+fn complex_to_magnitude(img: &ComplexImage) -> ComplexImage {
+    let height = img.height;
+    let width = img.width;
+    let mut magnitude = ComplexImage::new(width, height);
 
     for y in 0..height {
         for x in 0..width {
-            magnitude[y][x] = img[y][x].norm();
+            magnitude.put_pixel(x, y, Complex::new(img.get_pixel(x, y).norm(), 0.0));
         }
     }
 
     magnitude
-}
-
-// Helper function to save complex images as 16-bit PNGs with autoscaling
-fn save_complex_image(complex_data: &Vec<Vec<Complex<f32>>>, prefix: &str) -> io::Result<()> {
-    let height = complex_data.len() as u32;
-    let width = complex_data[0].len() as u32;
-
-    // Extract real and imaginary parts
-    let mut real_values = vec![vec![0.0; width as usize]; height as usize];
-    let mut imag_values = vec![vec![0.0; width as usize]; height as usize];
-
-    // Find min and max values for autoscaling
-    let mut min_real = f32::MAX;
-    let mut max_real = f32::MIN;
-    let mut min_imag = f32::MAX;
-    let mut max_imag = f32::MIN;
-
-    for y in 0..height {
-        for x in 0..width {
-            let complex = complex_data[y as usize][x as usize];
-            let real = complex.re;
-            let imag = complex.im;
-
-            real_values[y as usize][x as usize] = real;
-            imag_values[y as usize][x as usize] = imag;
-
-            min_real = min_real.min(real);
-            max_real = max_real.max(real);
-            min_imag = min_imag.min(imag);
-            max_imag = max_imag.max(imag);
-        }
-    }
-
-    // Create 16-bit images
-    let real_file = format!("{}_real.png", prefix);
-    let imag_file = format!("{}_imag.png", prefix);
-
-    // Create 16-bit real part image
-    let real_img = ImageBuffer::from_fn(width, height, |x, y| {
-        let val = real_values[y as usize][x as usize];
-        // Scale to 0-65535 range
-        let range = max_real - min_real;
-        let scaled = if range > 1e-10 {
-            ((val - min_real) / range * 65535.0) as u16
-        } else {
-            // Handle flat data
-            32768 as u16
-        };
-        Luma([scaled])
-    });
-
-    // Create 16-bit imaginary part image
-    let imag_img = ImageBuffer::from_fn(width, height, |x, y| {
-        let val = imag_values[y as usize][x as usize];
-        // Scale to 0-65535 range
-        let range = max_imag - min_imag;
-        let scaled = if range > 1e-10 {
-            ((val - min_imag) / range * 65535.0) as u16
-        } else {
-            // Handle flat data
-            32768 as u16
-        };
-        Luma([scaled])
-    });
-
-    // Save images
-    real_img
-        .save_with_format(&real_file, ImageFormat::Png)
-        .unwrap();
-    imag_img
-        .save_with_format(&imag_file, ImageFormat::Png)
-        .unwrap();
-
-    Ok(())
-}
-
-// Helper function to convert magnitude to GrayImage
-fn magnitude_to_image(magnitude: &Vec<Vec<f32>>) -> GrayImage {
-    let height = magnitude.len() as u32;
-    let width = magnitude[0].len() as u32;
-    let mut img = GrayImage::new(width, height);
-
-    // Find max value for normalization
-    let mut max_val: f32 = 0.0;
-    for row in magnitude.iter() {
-        for &val in row.iter() {
-            max_val = max_val.max(val);
-        }
-    }
-
-    // Normalize and convert to image
-    for y in 0..height {
-        for x in 0..width {
-            let normalized = (magnitude[y as usize][x as usize] / max_val * 255.0).min(255.0);
-            img.put_pixel(x, y, Luma([normalized as u8]));
-        }
-    }
-
-    img
 }
 
 // Helper function for phase cross correlation
@@ -423,10 +430,10 @@ fn apply_changes(image: &GrayImage) -> GrayImage {
     let translated = imageproc::geometric_transformations::translate(image, (SHIFTC, SHIFTR));
 
     // Create rotated image
-    let rotated = rotate_about_center(
+    let rotated = imageproc::geometric_transformations::rotate_about_center(
         &translated,
         ANGLE.to_radians(),
-        Interpolation::Bilinear,
+        imageproc::geometric_transformations::Interpolation::Bilinear,
         Luma([0]),
     );
 
@@ -450,28 +457,37 @@ fn apply_changes(image: &GrayImage) -> GrayImage {
     result
 }
 
-fn phase_cross_correlation(
-    img1: &Vec<Vec<Complex<f32>>>,
-    img2: &Vec<Vec<Complex<f32>>>,
-) -> (f32, f32) {
-    let height = img1.len();
-    let width = img1[0].len();
-    let mut result = vec![vec![Complex::new(0.0, 0.0); width]; height];
+fn phase_cross_correlation(img1: &ComplexImage, img2: &ComplexImage, name: &str) -> (f32, f32) {
+    let height = img1.height;
+    let width = img1.width;
+    let mut result = ComplexImage::new(width, height);
+
+    img1.save(&format!("img1_{name}"));
+    img2.save(&format!("img2_{name}"));
+
+    // Perform FFT for phase cross correlation
+    let mut img1_f = img1.clone();
+    let mut img2_f = img2.clone();
+    fft2d(&mut img1_f);
+    fft2d(&mut img2_f);
+
+    img1_f.save(&format!("img1_f_{name}"));
+    img2_f.save(&format!("img2_f_{name}"));
 
     // Compute the product of img1 and conjugate of img2
     for y in 0..height {
         for x in 0..width {
-            result[y][x] = img1[y][x] * img2[y][x].conj();
             // Normalize by magnitude
-            let magnitude = result[y][x].norm();
-            if magnitude > 1e-10 {
-                result[y][x] /= magnitude;
-            }
+            let val = img1_f.get_pixel(x, y) * img2_f.get_pixel(x, y).conj();
+            let val = val / val.norm();
+            result.put_pixel(x, y, val);
         }
     }
 
-    // Inverse FFT
-    fft2d(&mut result, true);
+    ifft2d(&mut result);
+
+    // Save cross-correlation FFT data
+    result.save(&format!("corr_{name}"));
 
     // Find the maximum
     let mut max_val = 0.0;
@@ -479,7 +495,7 @@ fn phase_cross_correlation(
     let mut max_x = 0;
     for y in 0..height {
         for x in 0..width {
-            let val = result[y][x].norm();
+            let val = result.get_pixel(x, y).re;
             if val > max_val {
                 max_val = val;
                 max_y = y;
@@ -487,6 +503,8 @@ fn phase_cross_correlation(
             }
         }
     }
+
+    eprintln!("raw max: {max_x} {max_y} {max_val}");
 
     // Adjust for wrap-around
     let shift_y = if max_y > height / 2 {
@@ -518,6 +536,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create Tukey window
     let tukey_window = tukey_window_2d(image_width, image_height, 1.0);
+    let bp_filt = make_log_filter(image_width as usize, image_height as usize, SIGMA);
 
     // Window images
     let mut wimage_complex = image_to_complex(&img_padded);
@@ -525,117 +544,89 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     apply_window(&mut wimage_complex, &tukey_window);
     apply_window(&mut rts_wimage_complex, &tukey_window);
+    wimage_complex.save("target_windowed");
+    rts_wimage_complex.save("mod_windowed");
 
     // Perform FFT
-    fft2d(&mut wimage_complex, false);
-    fft2d(&mut rts_wimage_complex, false);
+    fft2d(&mut wimage_complex);
+    fft2d(&mut rts_wimage_complex);
 
     // FFT shift
     fftshift(&mut wimage_complex);
     fftshift(&mut rts_wimage_complex);
 
     // Save original FFT data
-    save_complex_image(&wimage_complex, "fft_orig")?;
-    save_complex_image(&rts_wimage_complex, "fft_transformed")?;
+    wimage_complex.save("fft_orig");
+    rts_wimage_complex.save("fft_transformed");
 
     // Apply Laplacian of Gaussians bandpass filter
-    let bp_filt = make_log_filter(image_width, image_height, SIGMA);
-    save_complex_image(&bp_filt, "bandpass")?;
-    for y in 0..wimage_complex.len() {
-        for x in 0..wimage_complex[0].len() {
-            wimage_complex[y][x] *= bp_filt[y][x];
-            rts_wimage_complex[y][x] *= bp_filt[y][x];
+    bp_filt.save("bandpass");
+    for y in 0..image_height {
+        for x in 0..image_width {
+            let x = x as usize;
+            let y = y as usize;
+            let f = bp_filt.get_pixel(x, y);
+            wimage_complex.put_pixel(x, y, wimage_complex.get_pixel(x, y) * f);
+            rts_wimage_complex.put_pixel(x, y, rts_wimage_complex.get_pixel(x, y) * f);
         }
-
-        // Save filtered FFT data
-        save_complex_image(&wimage_complex, "fft_filtered_orig")?;
-        save_complex_image(&rts_wimage_complex, "fft_filtered_transformed")?;
     }
+    // Save filtered FFT data
+    wimage_complex.save("fft_filtered_orig");
+    rts_wimage_complex.save("fft_filtered_transformed");
 
-    // Save filtered images (for visualization)
-    let mut image_fs_filtered = wimage_complex.clone();
-    let mut rts_fs_filtered = rts_wimage_complex.clone();
+    {
+        // Save filtered images (for visualization)
+        let mut image_fs_filtered = wimage_complex.clone();
+        let mut rts_fs_filtered = rts_wimage_complex.clone();
 
-    fftshift(&mut image_fs_filtered);
-    fftshift(&mut rts_fs_filtered);
+        fftshift(&mut image_fs_filtered);
+        fftshift(&mut rts_fs_filtered);
 
-    // Save shifted data before inverse FFT
-    save_complex_image(&image_fs_filtered, "fft_shifted_orig")?;
-    save_complex_image(&rts_fs_filtered, "fft_shifted_transformed")?;
+        ifft2d(&mut image_fs_filtered);
+        ifft2d(&mut rts_fs_filtered);
 
-    fft2d(&mut image_fs_filtered, true);
-    fft2d(&mut rts_fs_filtered, true);
+        fftshift(&mut image_fs_filtered);
+        fftshift(&mut rts_fs_filtered);
 
-    // Save data after inverse FFT
-    save_complex_image(&image_fs_filtered, "ifft_orig")?;
-    save_complex_image(&rts_fs_filtered, "ifft_transformed")?;
+        // Save data after inverse FFT
+        image_fs_filtered.save("ifft_orig");
+        rts_fs_filtered.save("ifft_transformed");
+    }
 
     // Get magnitudes for log-polar transform
     let image_fs_mag = complex_to_magnitude(&wimage_complex);
     let rts_fs_mag = complex_to_magnitude(&rts_wimage_complex);
 
-    // Convert to gray images for warp_polar2
-    let image_fs_gray = magnitude_to_image(&image_fs_mag);
-    let rts_fs_gray = magnitude_to_image(&rts_fs_mag);
-
     // Create log-polar transformed FFT mag images
     let radius = image_height as u32 / 8; // only take lower frequencies
-    let shape = (image_height as u32, image_width as u32);
 
-    let warped_image_fs = warp_polar2(&image_fs_gray, radius, shape);
-    let warped_rts_fs = warp_polar2(&rts_fs_gray, radius, shape);
+    let mut warped_image_fs = warp_polar2(
+        &image_fs_mag,
+        radius,
+        image_width as usize,
+        image_height as usize,
+    );
+    let mut warped_rts_fs = warp_polar2(
+        &rts_fs_mag,
+        radius,
+        image_width as usize,
+        image_height as usize,
+    );
 
     // Use only half of FFT
-    let half_height = shape.0 / 2;
-    let warped_image_fs_half = ImageBuffer::from_fn(shape.1, half_height, |x, y| {
-        *warped_image_fs.get_pixel(x, y)
-    });
-
-    let warped_rts_fs_half =
-        ImageBuffer::from_fn(shape.1, half_height, |x, y| *warped_rts_fs.get_pixel(x, y));
-
-    // Convert back to complex for phase cross correlation
-    let mut warped_image_complex = image_to_complex(&warped_image_fs_half);
-    let mut warped_rts_complex = image_to_complex(&warped_rts_fs_half);
-
-    // Perform FFT for phase cross correlation
-    fft2d(&mut warped_image_complex, false);
-    fft2d(&mut warped_rts_complex, false);
-
-    // Save cross-correlation FFT data
-    save_complex_image(&warped_image_complex, "cross_corr_orig")?;
-    save_complex_image(&warped_rts_complex, "cross_corr_transformed")?;
 
     // Calculate phase cross correlation
-    let (shiftr, shiftc) = phase_cross_correlation(&warped_image_complex, &warped_rts_complex);
+    apply_window(&mut warped_image_fs, &tukey_window);
+    apply_window(&mut warped_rts_fs, &tukey_window);
+    let (shiftr, shiftc) = phase_cross_correlation(&warped_image_fs, &warped_rts_fs, "warp");
 
     // Calculate rotation and scaling
-    let recovered_angle = (360.0 / shape.0 as f32) * shiftr;
-    let klog = shape.1 as f32 / (radius as f32).ln();
+    let recovered_angle = (360.0 / image_height as f32) * shiftr;
+    let klog = image_width as f32 / (radius as f32).ln();
     let shift_scale = (shiftc / klog).exp();
-
-    // Save output images for visualization
-    image_fs_gray.save("output_fft_original.png")?;
-    rts_fs_gray.save("output_fft_transformed.png")?;
-
-    let image_filtered_gray = magnitude_to_image(&complex_to_magnitude(&image_fs_filtered));
-    let rts_filtered_gray = magnitude_to_image(&complex_to_magnitude(&rts_fs_filtered));
-
-    image_filtered_gray.save("output_filtered_original.png")?;
-    rts_filtered_gray.save("output_filtered_transformed.png")?;
-
-    warped_image_fs.save("output_logpolar_original.png")?;
-    warped_rts_fs.save("output_logpolar_transformed.png")?;
-
-    warped_image_fs_half.save("output_logpolar_half_original.png")?;
-    warped_rts_fs_half.save("output_logpolar_half_transformed.png")?;
-
-    // Convert tukey window to image for visualization
-    let tukey_window_img = ImageBuffer::from_fn(image_width, image_height, |x, y| {
-        let val = (tukey_window[y as usize][x as usize] * 255.0) as u8;
-        Luma([val])
-    });
-    tukey_window_img.save("output_tukey_window.png")?;
+    eprintln!(
+        "Log polar shift: {shiftr}, {shiftc}, angle: {recovered_angle}, scale: {shift_scale}"
+    );
 
     // Save original and transformed images
     img.save("output_original.png")?;
